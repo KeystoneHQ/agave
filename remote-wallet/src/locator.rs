@@ -14,11 +14,13 @@ pub enum Manufacturer {
     Unknown,
     Ledger,
     Trezor,
+    Keystone,
 }
 
 const MANUFACTURER_UNKNOWN: &str = "unknown";
 const MANUFACTURER_LEDGER: &str = "ledger";
 const MANUFACTURER_TREZOR: &str = "trezor";
+const MANUFACTURER_KEYSTONE: &str = "keystone";
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 #[error("not a manufacturer")]
@@ -37,6 +39,7 @@ impl FromStr for Manufacturer {
         match s.as_str() {
             MANUFACTURER_LEDGER => Ok(Self::Ledger),
             MANUFACTURER_TREZOR => Ok(Self::Trezor),
+            MANUFACTURER_KEYSTONE => Ok(Self::Keystone),
             _ => Err(ManufacturerError),
         }
     }
@@ -55,6 +58,7 @@ impl AsRef<str> for Manufacturer {
             Self::Unknown => MANUFACTURER_UNKNOWN,
             Self::Ledger => MANUFACTURER_LEDGER,
             Self::Trezor => MANUFACTURER_TREZOR,
+            Self::Keystone => MANUFACTURER_KEYSTONE,
         }
     }
 }

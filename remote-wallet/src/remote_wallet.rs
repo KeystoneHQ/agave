@@ -2,6 +2,7 @@
 use {crate::ledger::is_valid_ledger, parking_lot::Mutex, std::sync::Arc};
 use {
     crate::{
+        keystone::KeystoneWallet,
         ledger::LedgerWallet,
         ledger_error::LedgerError,
         locator::{Locator, LocatorError, Manufacturer},
@@ -127,6 +128,8 @@ impl RemoteWalletManager {
 
         let mut detected_devices = vec![];
         let mut errors = vec![];
+        
+        // Scan for Ledger devices via hidapi
         for device_info in devices.filter(|&device_info| {
             #[cfg(not(any(feature = "linux-static-libusb", feature = "linux-shared-libusb")))]
             let is_valid_hid_device =
@@ -161,6 +164,7 @@ impl RemoteWalletManager {
             }
         }
 
+        // Scan for Trezor devices
         for device in trezor_client::find_devices(false) {
             let mut trezor = match device.connect() {
                 Ok(t) => t,
@@ -189,6 +193,49 @@ impl RemoteWalletManager {
                 wallet_type: RemoteWalletType::Trezor(Rc::new(wallet)),
             });
         }
+
+        // Scan for Keystone devices via rusb
+        if let Ok(context) = rusb::Context::new() {
+            use rusb::UsbContext;
+            if let Ok(device_list) = context.devices() {
+                for device in device_list.iter() {
+                    if let Ok(desc) = device.device_descriptor() {
+                        if crate::keystone::is_valid_keystone(desc.vendor_id(), desc.product_id()) {
+                            match device.open() {
+                                Ok(handle) => {
+                                    println!("{}:{}", file!(), line!());
+                                    match KeystoneWallet::new(device.clone(), handle) {
+                                        Ok(mut keystone) => match keystone.read_device(&device) {
+                                            Ok(info) => {
+                                                keystone.pretty_path = info.get_pretty_path();
+                                                trace!("Found Keystone device: {info:?}");
+                                                detected_devices.push(Device {
+                                                    path: info.host_device_path.clone(),
+                                                    info,
+                                                    wallet_type: RemoteWalletType::Keystone(Rc::new(keystone)),
+                                                })
+                                            }
+                                            Err(err) => {
+                                                error!("Error connecting to Keystone device: {err}");
+                                                errors.push(err);
+                                            }
+                                        },
+                                        Err(err) => {
+                                            error!("Error initializing Keystone USB transport: {err}");
+                                            errors.push(err);
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    error!("Failed to open Keystone device: {err}");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let num_curr_devices = detected_devices.len();
         *self.devices.write() = detected_devices;
 
@@ -299,6 +346,7 @@ pub struct Device {
 pub enum RemoteWalletType {
     Ledger(Rc<LedgerWallet>),
     Trezor(Rc<TrezorWallet>),
+    Keystone(Rc<KeystoneWallet>),
 }
 
 /// Remote wallet information.
