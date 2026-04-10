@@ -27,8 +27,7 @@ use {
 
 static CHECK_MARK: Emoji = Emoji("✅ ", "");
 
-const REQUEST_ID: u16 = 0xACE0;
-const HID_TAG: u8 = 0xAA;
+const REQUEST_ID: u16 = 0x0000;
 
 /// Keystone vendor ID
 const KEYSTONE_VID: u16 = 0x1209;
@@ -37,6 +36,14 @@ const KEYSTONE_PID: u16 = 0x3001;
 
 const LEDGER_TRANSPORT_HEADER_LEN: usize = 5;
 const HID_PACKET_SIZE: usize = 64;
+const EAPDU_OFFSET_CLA: usize = 0;
+const EAPDU_OFFSET_INS: usize = 1;
+const EAPDU_OFFSET_P1: usize = 3;
+const EAPDU_OFFSET_P2: usize = 5;
+const EAPDU_OFFSET_LC: usize = 7;
+const EAPDU_OFFSET_CDATA: usize = 9;
+const EAPDU_RESPONSE_STATUS_LEN: usize = 2;
+const EAPDU_MAX_REQ_DATA_PER_PACKET: usize = HID_PACKET_SIZE - EAPDU_OFFSET_CDATA;
 
 // Windows adds a prefix byte to HID packets
 #[cfg(target_os = "windows")]
@@ -71,38 +78,12 @@ impl CommandType {
     }
 }
 
-const WEBUSB_PROTOCOL_HEADER: u8 = 0x6B;
-const WEBUSB_PROTOCOL_VERSION: u8 = 0;
-
-fn webusb_service_command(command: CommandType) -> (u8, u8) {
-    match command {
-        // SERVICE_ID_DEVICE_INFO + COMMAND_ID_DEVICE_INFO_BASIC
-        CommandType::CmdGetDeviceInfo => (1, 1),
-        // Keep compatibility for other calls until full service mapping is finalized.
-        _ => (1, command as u8),
-    }
-}
-
-fn crc32_ieee(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            if (crc & 1) != 0 {
-                crc = (crc >> 1) ^ 0xEDB8_8320;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    !crc
-}
-
 /// Keystone hardware wallet device
 pub struct KeystoneWallet {
     pub device: rusb::Device<rusb::Context>,
     pub handle: rusb::DeviceHandle<rusb::Context>,
     pub interface_number: u8,
+    pub setting_number: u8,
     pub endpoint_out: u8,
     pub endpoint_in: u8,
     pub transfer_type: rusb::TransferType,
@@ -122,8 +103,13 @@ impl KeystoneWallet {
         device: rusb::Device<rusb::Context>,
         handle: rusb::DeviceHandle<rusb::Context>,
     ) -> Result<Self, RemoteWalletError> {
-        let (interface_number, endpoint_out, endpoint_in, transfer_type) =
+        let (interface_number, setting_number, endpoint_out, endpoint_in, transfer_type) =
             Self::discover_usb_io(&device)?;
+
+        println!(
+            "[Keystone USB] selected interface={}, setting={}, ep_out=0x{:02x}, ep_in=0x{:02x}, transfer={:?}",
+            interface_number, setting_number, endpoint_out, endpoint_in, transfer_type
+        );
 
         // Best effort: detach kernel driver where supported.
         #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -137,10 +123,19 @@ impl KeystoneWallet {
             ))
         })?;
 
+        handle
+            .set_alternate_setting(interface_number, setting_number)
+            .map_err(|e| {
+                RemoteWalletError::Hid(format!(
+                    "Failed to set alternate setting {setting_number} on interface {interface_number}: {e}"
+                ))
+            })?;
+
         Ok(Self {
             device,
             handle,
             interface_number,
+            setting_number,
             endpoint_out,
             endpoint_in,
             transfer_type,
@@ -152,7 +147,7 @@ impl KeystoneWallet {
 
     fn discover_usb_io(
         device: &rusb::Device<rusb::Context>,
-    ) -> Result<(u8, u8, u8, rusb::TransferType), RemoteWalletError> {
+    ) -> Result<(u8, u8, u8, u8, rusb::TransferType), RemoteWalletError> {
         let config = device
             .active_config_descriptor()
             .or_else(|_| device.config_descriptor(0))
@@ -160,8 +155,60 @@ impl KeystoneWallet {
                 RemoteWalletError::Hid(format!("Failed to read USB config descriptor: {e}"))
             })?;
 
-        // Prefer interrupt endpoints (HID-like), fall back to bulk if needed.
-        for wanted_type in [rusb::TransferType::Interrupt, rusb::TransferType::Bulk] {
+        for interface in config.interfaces() {
+            for descriptor in interface.descriptors() {
+                println!(
+                    "[Keystone USB] candidate interface={}, setting={}, class=0x{:02x}, subclass=0x{:02x}, protocol=0x{:02x}",
+                    descriptor.interface_number(),
+                    descriptor.setting_number(),
+                    descriptor.class_code(),
+                    descriptor.sub_class_code(),
+                    descriptor.protocol_code()
+                );
+                for ep in descriptor.endpoint_descriptors() {
+                    println!(
+                        "[Keystone USB]   ep=0x{:02x}, dir={:?}, transfer={:?}, max_packet_size={}",
+                        ep.address(),
+                        ep.direction(),
+                        ep.transfer_type(),
+                        ep.max_packet_size()
+                    );
+                }
+            }
+        }
+
+        // Match webusb-cli behavior first: interface 0, alternate setting 0, first IN/OUT endpoints.
+        for interface in config.interfaces() {
+            for descriptor in interface.descriptors() {
+                if descriptor.interface_number() != 0 || descriptor.setting_number() != 0 {
+                    continue;
+                }
+                let mut endpoint_out = None;
+                let mut endpoint_in = None;
+                for ep in descriptor.endpoint_descriptors() {
+                    match ep.direction() {
+                        rusb::Direction::Out => {
+                            endpoint_out.get_or_insert(ep.address());
+                        }
+                        rusb::Direction::In => {
+                            endpoint_in.get_or_insert(ep.address());
+                        }
+                    }
+                }
+                if let (Some(out), Some(inn)) = (endpoint_out, endpoint_in) {
+                    return Ok((
+                        descriptor.interface_number(),
+                        descriptor.setting_number(),
+                        out,
+                        inn,
+                        rusb::TransferType::Bulk,
+                    ));
+                }
+            }
+        }
+
+        // Fallback: scan all interfaces/settings, BULK first, then INTERRUPT.
+        for wanted_type in [rusb::TransferType::Bulk, rusb::TransferType::Interrupt] {
             for interface in config.interfaces() {
                 for descriptor in interface.descriptors() {
                     let mut endpoint_out = None;
@@ -180,7 +227,13 @@ impl KeystoneWallet {
                         }
                     }
                     if let (Some(out), Some(inn)) = (endpoint_out, endpoint_in) {
-                        return Ok((descriptor.interface_number(), out, inn, wanted_type));
+                        return Ok((
+                            descriptor.interface_number(),
+                            descriptor.setting_number(),
+                            out,
+                            inn,
+                            wanted_type,
+                        ));
                     }
                 }
             }
@@ -193,116 +246,161 @@ impl KeystoneWallet {
 
     /// Write data to device with Keystone USB transport framing
     fn write(&self, command: CommandType, data: &[u8]) -> Result<(), RemoteWalletError> {
-        let (service_id, command_id) = webusb_service_command(command);
-        let payload_len = data.len();
-
-        // FrameHead_t (packed, little-endian u16 fields):
-        // head(1), protocolVersion(1), packetIndex(2), serviceId(1), commandId(1), flag(2), length(2)
-        const HEAD_LEN: usize = 10;
-        const CRC_LEN: usize = 4;
-        let mut frame = Vec::with_capacity(HEAD_LEN + payload_len + CRC_LEN);
-        frame.push(WEBUSB_PROTOCOL_HEADER);
-        frame.push(WEBUSB_PROTOCOL_VERSION);
-        frame.extend_from_slice(&0u16.to_le_bytes()); // packetIndex
-        frame.push(service_id);
-        frame.push(command_id);
-        frame.extend_from_slice(&0x0002u16.to_le_bytes()); // isHost=1, ack=0
-        frame.extend_from_slice(&(payload_len as u16).to_le_bytes());
-        frame.extend_from_slice(data);
-
-        let crc = crc32_ieee(&frame);
-        frame.extend_from_slice(&crc.to_le_bytes());
-
-        println!(
-            "[Keystone TX] command={:?}, svc={}, cmdId={}, payload_len={}, frame_hex: {}",
-            command,
-            service_id,
-            command_id,
-            payload_len,
-            hex::encode(&frame)
+        let total_packets = std::cmp::max(
+            1,
+            data.len().div_ceil(EAPDU_MAX_REQ_DATA_PER_PACKET),
         );
 
-        self.device_write(&frame)?;
+        for packet_index in 0..total_packets {
+            let start = packet_index * EAPDU_MAX_REQ_DATA_PER_PACKET;
+            let end = std::cmp::min(start + EAPDU_MAX_REQ_DATA_PER_PACKET, data.len());
+            let chunk = &data[start..end];
+
+            let mut eapdu_packet = vec![0u8; EAPDU_OFFSET_CDATA + chunk.len()];
+            eapdu_packet[EAPDU_OFFSET_CLA] = 0x00;
+            eapdu_packet[EAPDU_OFFSET_INS..EAPDU_OFFSET_INS + 2]
+                .copy_from_slice(&(command as u16).to_be_bytes());
+            eapdu_packet[EAPDU_OFFSET_P1..EAPDU_OFFSET_P1 + 2]
+                .copy_from_slice(&(total_packets as u16).to_be_bytes());
+            eapdu_packet[EAPDU_OFFSET_P2..EAPDU_OFFSET_P2 + 2]
+                .copy_from_slice(&(packet_index as u16).to_be_bytes());
+            eapdu_packet[EAPDU_OFFSET_LC..EAPDU_OFFSET_LC + 2]
+                .copy_from_slice(&REQUEST_ID.to_be_bytes());
+            eapdu_packet[EAPDU_OFFSET_CDATA..].copy_from_slice(chunk);
+
+            let tx = eapdu_packet;
+
+            println!(
+                "[Keystone TX] command={:?}, total={}, idx={}, req_id=0x{:04x}, write_len={}, packet_hex: {}",
+                command,
+                total_packets,
+                packet_index,
+                REQUEST_ID,
+                tx.len(),
+                hex::encode(&tx)
+            );
+
+            self.device_write(&tx)?;
+        }
+
         Ok(())
     }
 
     /// Read data from device with Keystone USB transport parsing
     fn read(&self) -> Result<Vec<u8>, RemoteWalletError> {
-        let mut result_data = Vec::new();
-        let mut expected_next_seq: Option<u16> = None;
-        let mut total_packets: u16 = 0;
-        let mut received_packets: u16 = 0;
+        let mut total_packets: Option<u16> = None;
+        let mut expected_req_id: Option<u16> = None;
+        let mut expected_command: Option<u16> = None;
+        let mut packet_chunks: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut response_status: Option<u16> = None;
 
         loop {
             let chunk = self.device_read()?;
-            if chunk.len() < 12 {
-                return Err(RemoteWalletError::Protocol("Invalid HID packet size"));
+            if chunk.len() < EAPDU_OFFSET_CDATA + EAPDU_RESPONSE_STATUS_LEN {
+                return Err(RemoteWalletError::Protocol("Invalid EAPDU packet size"));
             }
 
-            let mut selected: Option<(usize, u16, u16, u16, usize)> = None;
+            let mut selected: Option<(usize, u16, u16, u16, u16)> = None;
             for offset in [0usize, 1usize] {
-                if chunk.len() < offset + 12 {
+                if chunk.len() < offset + EAPDU_OFFSET_CDATA + EAPDU_RESPONSE_STATUS_LEN {
                     continue;
                 }
                 let packet = &chunk[offset..];
-                let command = u16::from_be_bytes([packet[2], packet[3]]);
-                let total_pkt = u16::from_be_bytes([packet[4], packet[5]]);
-                let packet_seq = u16::from_be_bytes([packet[6], packet[7]]);
-                let size = packet[11] as usize;
+                let command = u16::from_be_bytes([
+                    packet[EAPDU_OFFSET_INS],
+                    packet[EAPDU_OFFSET_INS + 1],
+                ]);
+                let total_pkt = u16::from_be_bytes([
+                    packet[EAPDU_OFFSET_P1],
+                    packet[EAPDU_OFFSET_P1 + 1],
+                ]);
+                let packet_seq = u16::from_be_bytes([
+                    packet[EAPDU_OFFSET_P2],
+                    packet[EAPDU_OFFSET_P2 + 1],
+                ]);
+                let req_id = u16::from_be_bytes([
+                    packet[EAPDU_OFFSET_LC],
+                    packet[EAPDU_OFFSET_LC + 1],
+                ]);
                 if CommandType::is_valid_command(command)
                     && total_pkt > 0
-                    && size <= packet.len().saturating_sub(12)
+                    && packet_seq < total_pkt
                 {
-                    selected = Some((offset, command, total_pkt, packet_seq, size));
+                    selected = Some((offset, command, total_pkt, packet_seq, req_id));
                     break;
                 }
             }
 
-            let (offset, command, total_pkt, packet_seq, size) = selected
+            let (offset, command, total_pkt, packet_seq, req_id) = selected
                 .ok_or(RemoteWalletError::Protocol("Unable to parse packet header"))?;
 
             let packet = &chunk[offset..];
             let packet_hex = hex::encode(packet);
+            let packet_payload = &packet[EAPDU_OFFSET_CDATA..];
+            if packet_payload.len() < EAPDU_RESPONSE_STATUS_LEN {
+                return Err(RemoteWalletError::Protocol("EAPDU payload too short"));
+            }
+
+            let payload_len = packet_payload.len() - EAPDU_RESPONSE_STATUS_LEN;
+            let status = u16::from_be_bytes([
+                packet_payload[payload_len],
+                packet_payload[payload_len + 1],
+            ]);
             println!(
-                "[Keystone RX] off={}, cmd=0x{:04x}, total={}, seq={}, size={}, raw_hex: {}",
-                offset, command, total_pkt, packet_seq, size, packet_hex
+                "[Keystone RX] off={}, cmd=0x{:04x}, total={}, idx={}, req_id=0x{:04x}, payload_len={}, status=0x{:04x}, raw_hex: {}",
+                offset,
+                command,
+                total_pkt,
+                packet_seq,
+                req_id,
+                payload_len,
+                status,
+                packet_hex
             );
 
-            if expected_next_seq.is_none() {
-                expected_next_seq = Some(packet_seq);
-                total_packets = total_pkt;
+            if total_packets.is_none() {
+                total_packets = Some(total_pkt);
+                expected_req_id = Some(req_id);
+                expected_command = Some(command);
+                packet_chunks = vec![None; total_pkt as usize];
             }
 
-            if Some(packet_seq) != expected_next_seq {
-                return Err(RemoteWalletError::Protocol("Invalid packet sequence"));
-            }
-
-            let end = std::cmp::min(12 + size, packet.len());
-            result_data.extend_from_slice(&packet[12..end]);
-
-            received_packets += 1;
-            expected_next_seq = Some(packet_seq.wrapping_add(1));
-
-            if received_packets >= total_packets {
-                break;
-            }
-
-            if received_packets >= 0xffff {
+            if total_packets != Some(total_pkt)
+                || expected_req_id != Some(req_id)
+                || expected_command != Some(command)
+            {
                 return Err(RemoteWalletError::Protocol(
-                    "Maximum sequence number reached",
+                    "Mismatched EAPDU packet header across fragments",
                 ));
             }
+
+            let idx = packet_seq as usize;
+            if packet_chunks[idx].is_none() {
+                packet_chunks[idx] = Some(packet_payload[..payload_len].to_vec());
+            }
+
+            if response_status.is_none() {
+                response_status = Some(status);
+            }
+
+            if packet_chunks.iter().all(|c| c.is_some()) {
+                break;
+            }
         }
 
-        while !result_data.is_empty() && result_data[result_data.len() - 1] == 0x00 {
-            result_data.pop();
+        let mut result_data = Vec::new();
+        for chunk in packet_chunks {
+            if let Some(chunk) = chunk {
+                result_data.extend_from_slice(&chunk);
+            }
         }
 
-        if result_data.len() < 2 {
-            return Err(RemoteWalletError::Protocol("Response too short"));
+        if let Some(status) = response_status {
+            if status != 0 {
+                return Err(RemoteWalletError::Protocol("EAPDU returned non-success status"));
+            }
         }
 
-        result_data.truncate(result_data.len() - 2);
         Ok(result_data)
     }
 
@@ -515,7 +613,6 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
         _dev_info: &rusb::Device<rusb::Context>,
     ) -> Result<RemoteWalletInfo, RemoteWalletError> {
         // Get device info (firmware version and MFP)
-        println!("{}:{}", file!(), line!());
         let (version, mfp) = self.get_device_info()?;
         self.version = version;
         self.mfp = mfp;
@@ -537,7 +634,8 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
             .unwrap_or_else(|_| "Unknown".to_string());
 
         // Try to get default pubkey
-        let pubkey_result = self.get_pubkey(&DerivationPath::default(), false);
+        let default_path = DerivationPath::new_bip44(Some(0), Some(0));
+        let pubkey_result = self.get_pubkey(&default_path, false);
         let (pubkey, error) = match pubkey_result {
             Ok(pubkey) => (pubkey, None),
             Err(err) => (Pubkey::default(), Some(err)),
@@ -563,6 +661,8 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
         confirm_key: bool,
     ) -> Result<Pubkey, RemoteWalletError> {
         let ur_request = self.generate_hardware_call(derivation_path)?;
+        println!("ur_request = {} {}:{}", ur_request, file!(), line!());
+        let ur_request = "UR:QR-HARDWARE-CALL/OXADAEAOTAAHBZOYADLYTAAHCMOXADTAADDYOYADLRCSDWYKCFADYKYKAOADAXAEAAIAGUGWGSAXJOGRIHKKJKJYJLJTIHCXGOGUFWCXGUFYGRAAADLRTBIAFY";
 
         if confirm_key {
             println!(
@@ -640,12 +740,38 @@ fn parse_crypto_key_path(
     let mut path_components = Vec::new();
 
     for index in derivation_path.path() {
-        // PathComponent::new takes (index: Option<u32>, hardened: bool)
-        // We'll use a reasonable approach assuming hardened components
-        if let Ok(component) = PathComponent::new(Some(index.to_bits()), true) {
+        // DerivationPath index uses bit31 as hardened flag, while PathComponent expects
+        // plain index value + separate hardened bool.
+        let bits = index.to_bits();
+        let hardened = (bits & 0x8000_0000) != 0;
+        let value = bits & 0x7fff_ffff;
+        if let Ok(component) = PathComponent::new(Some(value), hardened) {
             path_components.push(component);
         }
     }
+
+    // Some call sites may pass an empty/default derivation path; use Solana default m/44'/501'/0'/0'.
+    if path_components.is_empty() {
+        if let Ok(component) = PathComponent::new(Some(44u32), true) {
+            path_components.push(component);
+        }
+        if let Ok(component) = PathComponent::new(Some(501u32), true) {
+            path_components.push(component);
+        }
+        if let Ok(component) = PathComponent::new(Some(0u32), true) {
+            path_components.push(component);
+        }
+        // if let Ok(component) = PathComponent::new(Some(0u32), true) {
+        //     path_components.push(component);
+        // }
+        println!("[Keystone Path] input derivation path empty, fallback to m/44'/501'/0'/0'");
+    }
+
+    println!(
+        "[Keystone Path] components_count={}, mfp={}",
+        path_components.len(),
+        mfp.map(hex::encode).unwrap_or_else(|| "<none>".to_string())
+    );
 
     // CryptoKeyPath::new takes (components, master_fingerprint, depth) and returns CryptoKeyPath.
     CryptoKeyPath::new(path_components, mfp, None)

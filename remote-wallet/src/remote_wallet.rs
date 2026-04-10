@@ -195,15 +195,24 @@ impl RemoteWalletManager {
         }
 
         // Scan for Keystone devices via rusb
+        const KEYSTONE_VENDOR_ID: u16 = 0x1209;
         if let Ok(context) = rusb::Context::new() {
             use rusb::UsbContext;
             if let Ok(device_list) = context.devices() {
                 for device in device_list.iter() {
                     if let Ok(desc) = device.device_descriptor() {
-                        if crate::keystone::is_valid_keystone(desc.vendor_id(), desc.product_id()) {
+                        // Some firmware modes may expose a different PID; use VID-based prefilter,
+                        // then still prefer known Keystone VID/PID path.
+                        if desc.vendor_id() == KEYSTONE_VENDOR_ID
+                            || crate::keystone::is_valid_keystone(desc.vendor_id(), desc.product_id())
+                        {
+                            println!(
+                                "[Keystone Discover] candidate vid=0x{:04x}, pid=0x{:04x}",
+                                desc.vendor_id(),
+                                desc.product_id()
+                            );
                             match device.open() {
                                 Ok(handle) => {
-                                    println!("{}:{}", file!(), line!());
                                     match KeystoneWallet::new(device.clone(), handle) {
                                         Ok(mut keystone) => match keystone.read_device(&device) {
                                             Ok(info) => {
@@ -228,6 +237,11 @@ impl RemoteWalletManager {
                                 }
                                 Err(err) => {
                                     error!("Failed to open Keystone device: {err}");
+                                    errors.push(RemoteWalletError::Hid(format!(
+                                        "Failed to open Keystone device {:04x}:{:04x}: {err}",
+                                        desc.vendor_id(),
+                                        desc.product_id()
+                                    )));
                                 }
                             }
                         }
