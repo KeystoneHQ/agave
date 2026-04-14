@@ -122,12 +122,29 @@ impl RemoteWalletManager {
     pub fn update_devices(&self) -> Result<usize, RemoteWalletError> {
         let mut usb = self.usb.lock();
         usb.refresh_devices()?;
-        let devices = usb.device_list();
         let num_prev_devices = self.devices.read().len();
 
         let mut detected_devices = vec![];
         let mut errors = vec![];
-        for device_info in devices.filter(|&device_info| {
+        Self::scan_ledger_devices(&usb, &mut detected_devices, &mut errors);
+        Self::scan_trezor_devices(&mut detected_devices, &mut errors);
+        let num_curr_devices = detected_devices.len();
+        *self.devices.write() = detected_devices;
+
+        if num_curr_devices == 0 && !errors.is_empty() {
+            return Err(errors[0].clone());
+        }
+
+        Ok(num_curr_devices - num_prev_devices)
+    }
+
+    #[cfg(feature = "hidapi")]
+    fn scan_ledger_devices(
+        usb: &hidapi::HidApi,
+        detected_devices: &mut Vec<Device>,
+        errors: &mut Vec<RemoteWalletError>,
+    ) {
+        for device_info in usb.device_list().filter(|&device_info| {
             #[cfg(not(any(feature = "linux-static-libusb", feature = "linux-shared-libusb")))]
             let is_valid_hid_device =
                 is_valid_hid_device(device_info.usage_page(), device_info.interface_number());
@@ -160,7 +177,13 @@ impl RemoteWalletManager {
                 Err(err) => error!("Error connecting to ledger device to read info: {err}"),
             }
         }
+    }
 
+    #[cfg(feature = "hidapi")]
+    fn scan_trezor_devices(
+        detected_devices: &mut Vec<Device>,
+        errors: &mut Vec<RemoteWalletError>,
+    ) {
         for device in trezor_client::find_devices(false) {
             let mut trezor = match device.connect() {
                 Ok(t) => t,
@@ -189,14 +212,6 @@ impl RemoteWalletManager {
                 wallet_type: RemoteWalletType::Trezor(Rc::new(wallet)),
             });
         }
-        let num_curr_devices = detected_devices.len();
-        *self.devices.write() = detected_devices;
-
-        if num_curr_devices == 0 && !errors.is_empty() {
-            return Err(errors[0].clone());
-        }
-
-        Ok(num_curr_devices - num_prev_devices)
     }
 
     #[cfg(not(feature = "hidapi"))]
@@ -299,6 +314,30 @@ pub struct Device {
 pub enum RemoteWalletType {
     Ledger(Rc<LedgerWallet>),
     Trezor(Rc<TrezorWallet>),
+}
+
+impl RemoteWalletType {
+    pub fn get_pubkey(
+        &self,
+        derivation_path: &DerivationPath,
+        confirm_key: bool,
+    ) -> Result<Pubkey, RemoteWalletError> {
+        match self {
+            Self::Ledger(wallet) => wallet.get_pubkey(derivation_path, confirm_key),
+            Self::Trezor(wallet) => wallet.get_pubkey(derivation_path, confirm_key),
+        }
+    }
+
+    pub fn sign_message(
+        &self,
+        derivation_path: &DerivationPath,
+        message: &[u8],
+    ) -> Result<Signature, RemoteWalletError> {
+        match self {
+            Self::Ledger(wallet) => wallet.sign_message(derivation_path, message),
+            Self::Trezor(wallet) => wallet.sign_message(derivation_path, message),
+        }
+    }
 }
 
 /// Remote wallet information.

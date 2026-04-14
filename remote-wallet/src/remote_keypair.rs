@@ -27,10 +27,7 @@ impl RemoteKeypair {
         confirm_key: bool,
         path: String,
     ) -> Result<Self, RemoteWalletError> {
-        let pubkey = match &wallet_type {
-            RemoteWalletType::Ledger(wallet) => wallet.get_pubkey(&derivation_path, confirm_key)?,
-            RemoteWalletType::Trezor(wallet) => wallet.get_pubkey(&derivation_path, confirm_key)?,
-        };
+        let pubkey = wallet_type.get_pubkey(&derivation_path, confirm_key)?;
 
         Ok(Self {
             wallet_type,
@@ -47,14 +44,9 @@ impl Signer for RemoteKeypair {
     }
 
     fn try_sign_message(&self, message: &[u8]) -> Result<Signature, SignerError> {
-        match &self.wallet_type {
-            RemoteWalletType::Ledger(wallet) => wallet
-                .sign_message(&self.derivation_path, message)
-                .map_err(|e| e.into()),
-            RemoteWalletType::Trezor(wallet) => wallet
-                .sign_message(&self.derivation_path, message)
-                .map_err(|e| e.into()),
-        }
+        self.wallet_type
+            .sign_message(&self.derivation_path, message)
+            .map_err(|e| e.into())
     }
 
     fn is_interactive(&self) -> bool {
