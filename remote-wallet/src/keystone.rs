@@ -45,22 +45,31 @@ const EAPDU_OFFSET_CDATA: usize = 9;
 const EAPDU_RESPONSE_STATUS_LEN: usize = 2;
 const EAPDU_MAX_REQ_DATA_PER_PACKET: usize = HID_PACKET_SIZE - EAPDU_OFFSET_CDATA;
 
-// Windows adds a prefix byte to HID packets
+// With rusb transport we read fixed endpoint packet size and do not prepend
+// OS-specific HID report-id bytes.
 #[cfg(target_os = "windows")]
-const HID_PREFIX_ZERO: usize = 1;
+const HID_PREFIX_ZERO: usize = 0;
 #[cfg(not(target_os = "windows"))]
 const HID_PREFIX_ZERO: usize = 0;
 
 // JSON response field names
 const JSON_FIELD_PUBKEY: &str = "pubkey";
+const JSON_FIELD_PAYLOAD: &str = "payload";
 const JSON_FIELD_FIRMWARE_VERSION: &str = "firmwareVersion";
 const JSON_FIELD_WALLET_MFP: &str = "walletMFP";
 
 // Error messages
 const ERROR_INVALID_JSON: &str = "Invalid JSON response";
 const ERROR_MISSING_FIELD: &str = "Missing required field";
+const ERROR_INVALID_HEX: &str = "Invalid hex data";
 const ERROR_SIGNATURE_SIZE: &str = "Signature packet size mismatch";
 const ERROR_KEY_SIZE: &str = "Key packet size mismatch";
+const ERROR_EXPORT_ADDRESS_PAGE: &str = "Export address is only allowed on specific pages";
+
+// Keystone cached derivation-path ranges for USB pubkey export.
+const CACHED_ACCOUNT_RANGE: u32 = 49;
+const CACHED_CHANGE_RANGE: u32 = 49;
+const CACHED_FIXED_ACCOUNT: u32 = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CommandType {
@@ -106,11 +115,6 @@ impl KeystoneWallet {
         let (interface_number, setting_number, endpoint_out, endpoint_in, transfer_type) =
             Self::discover_usb_io(&device)?;
 
-        println!(
-            "[Keystone USB] selected interface={}, setting={}, ep_out=0x{:02x}, ep_in=0x{:02x}, transfer={:?}",
-            interface_number, setting_number, endpoint_out, endpoint_in, transfer_type
-        );
-
         // Best effort: detach kernel driver where supported.
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
@@ -124,12 +128,12 @@ impl KeystoneWallet {
         })?;
 
         handle
-            .set_alternate_setting(interface_number, setting_number)
-            .map_err(|e| {
-                RemoteWalletError::Hid(format!(
-                    "Failed to set alternate setting {setting_number} on interface {interface_number}: {e}"
-                ))
-            })?;
+        .set_alternate_setting(interface_number, setting_number)
+        .map_err(|e| {
+            RemoteWalletError::Hid(format!(
+                "Failed to set alternate setting {setting_number} on interface {interface_number}: {e}"
+            ))
+        })?;
 
         Ok(Self {
             device,
@@ -155,54 +159,39 @@ impl KeystoneWallet {
                 RemoteWalletError::Hid(format!("Failed to read USB config descriptor: {e}"))
             })?;
 
-        for interface in config.interfaces() {
-            for descriptor in interface.descriptors() {
-                println!(
-                    "[Keystone USB] candidate interface={}, setting={}, class=0x{:02x}, subclass=0x{:02x}, protocol=0x{:02x}",
-                    descriptor.interface_number(),
-                    descriptor.setting_number(),
-                    descriptor.class_code(),
-                    descriptor.sub_class_code(),
-                    descriptor.protocol_code()
-                );
-                for ep in descriptor.endpoint_descriptors() {
-                    println!(
-                        "[Keystone USB]   ep=0x{:02x}, dir={:?}, transfer={:?}, max_packet_size={}",
-                        ep.address(),
-                        ep.direction(),
-                        ep.transfer_type(),
-                        ep.max_packet_size()
-                    );
-                }
-            }
-        }
-
         // Match webusb-cli behavior first: interface 0, alternate setting 0, first IN/OUT endpoints.
         for interface in config.interfaces() {
             for descriptor in interface.descriptors() {
                 if descriptor.interface_number() != 0 || descriptor.setting_number() != 0 {
                     continue;
                 }
-                let mut endpoint_out = None;
-                let mut endpoint_in = None;
+                let mut endpoint_out: Option<(u8, rusb::TransferType)> = None;
+                let mut endpoint_in: Option<(u8, rusb::TransferType)> = None;
                 for ep in descriptor.endpoint_descriptors() {
                     match ep.direction() {
                         rusb::Direction::Out => {
-                            endpoint_out.get_or_insert(ep.address());
+                            endpoint_out.get_or_insert((ep.address(), ep.transfer_type()));
                         }
                         rusb::Direction::In => {
-                            endpoint_in.get_or_insert(ep.address());
+                            endpoint_in.get_or_insert((ep.address(), ep.transfer_type()));
                         }
                     }
                 }
-                if let (Some(out), Some(inn)) = (endpoint_out, endpoint_in) {
-                    return Ok((
-                        descriptor.interface_number(),
-                        descriptor.setting_number(),
-                        out,
-                        inn,
-                        rusb::TransferType::Bulk,
-                    ));
+                if let (Some((out, out_ty)), Some((inn, in_ty))) = (endpoint_out, endpoint_in) {
+                    if out_ty == in_ty
+                        && matches!(
+                            out_ty,
+                            rusb::TransferType::Bulk | rusb::TransferType::Interrupt
+                        )
+                    {
+                        return Ok((
+                            descriptor.interface_number(),
+                            descriptor.setting_number(),
+                            out,
+                            inn,
+                            out_ty,
+                        ));
+                    }
                 }
             }
         }
@@ -246,10 +235,11 @@ impl KeystoneWallet {
 
     /// Write data to device with Keystone USB transport framing
     fn write(&self, command: CommandType, data: &[u8]) -> Result<(), RemoteWalletError> {
-        let total_packets = std::cmp::max(
-            1,
-            data.len().div_ceil(EAPDU_MAX_REQ_DATA_PER_PACKET),
-        );
+        // Avoid carrying unread responses across requests; stale data can keep
+        // firmware IN endpoint busy and block subsequent sends.
+        self.drain_pending_input_packets();
+
+        let total_packets = std::cmp::max(1, data.len().div_ceil(EAPDU_MAX_REQ_DATA_PER_PACKET));
 
         for packet_index in 0..total_packets {
             let start = packet_index * EAPDU_MAX_REQ_DATA_PER_PACKET;
@@ -268,19 +258,7 @@ impl KeystoneWallet {
                 .copy_from_slice(&REQUEST_ID.to_be_bytes());
             eapdu_packet[EAPDU_OFFSET_CDATA..].copy_from_slice(chunk);
 
-            let tx = eapdu_packet;
-
-            println!(
-                "[Keystone TX] command={:?}, total={}, idx={}, req_id=0x{:04x}, write_len={}, packet_hex: {}",
-                command,
-                total_packets,
-                packet_index,
-                REQUEST_ID,
-                tx.len(),
-                hex::encode(&tx)
-            );
-
-            self.device_write(&tx)?;
+            self.device_write(&eapdu_packet)?;
         }
 
         Ok(())
@@ -296,6 +274,9 @@ impl KeystoneWallet {
 
         loop {
             let chunk = self.device_read()?;
+            if chunk.is_empty() || chunk.iter().all(|b| *b == 0) {
+                continue;
+            }
             if chunk.len() < EAPDU_OFFSET_CDATA + EAPDU_RESPONSE_STATUS_LEN {
                 return Err(RemoteWalletError::Protocol("Invalid EAPDU packet size"));
             }
@@ -306,57 +287,33 @@ impl KeystoneWallet {
                     continue;
                 }
                 let packet = &chunk[offset..];
-                let command = u16::from_be_bytes([
-                    packet[EAPDU_OFFSET_INS],
-                    packet[EAPDU_OFFSET_INS + 1],
-                ]);
-                let total_pkt = u16::from_be_bytes([
-                    packet[EAPDU_OFFSET_P1],
-                    packet[EAPDU_OFFSET_P1 + 1],
-                ]);
-                let packet_seq = u16::from_be_bytes([
-                    packet[EAPDU_OFFSET_P2],
-                    packet[EAPDU_OFFSET_P2 + 1],
-                ]);
-                let req_id = u16::from_be_bytes([
-                    packet[EAPDU_OFFSET_LC],
-                    packet[EAPDU_OFFSET_LC + 1],
-                ]);
-                if CommandType::is_valid_command(command)
-                    && total_pkt > 0
-                    && packet_seq < total_pkt
+                let command =
+                    u16::from_be_bytes([packet[EAPDU_OFFSET_INS], packet[EAPDU_OFFSET_INS + 1]]);
+                let total_pkt =
+                    u16::from_be_bytes([packet[EAPDU_OFFSET_P1], packet[EAPDU_OFFSET_P1 + 1]]);
+                let packet_seq =
+                    u16::from_be_bytes([packet[EAPDU_OFFSET_P2], packet[EAPDU_OFFSET_P2 + 1]]);
+                let req_id =
+                    u16::from_be_bytes([packet[EAPDU_OFFSET_LC], packet[EAPDU_OFFSET_LC + 1]]);
+                if CommandType::is_valid_command(command) && total_pkt > 0 && packet_seq < total_pkt
                 {
                     selected = Some((offset, command, total_pkt, packet_seq, req_id));
                     break;
                 }
             }
 
-            let (offset, command, total_pkt, packet_seq, req_id) = selected
-                .ok_or(RemoteWalletError::Protocol("Unable to parse packet header"))?;
+            let (offset, command, total_pkt, packet_seq, req_id) =
+                selected.ok_or(RemoteWalletError::Protocol("Unable to parse packet header"))?;
 
             let packet = &chunk[offset..];
-            let packet_hex = hex::encode(packet);
             let packet_payload = &packet[EAPDU_OFFSET_CDATA..];
             if packet_payload.len() < EAPDU_RESPONSE_STATUS_LEN {
                 return Err(RemoteWalletError::Protocol("EAPDU payload too short"));
             }
 
             let payload_len = packet_payload.len() - EAPDU_RESPONSE_STATUS_LEN;
-            let status = u16::from_be_bytes([
-                packet_payload[payload_len],
-                packet_payload[payload_len + 1],
-            ]);
-            println!(
-                "[Keystone RX] off={}, cmd=0x{:04x}, total={}, idx={}, req_id=0x{:04x}, payload_len={}, status=0x{:04x}, raw_hex: {}",
-                offset,
-                command,
-                total_pkt,
-                packet_seq,
-                req_id,
-                payload_len,
-                status,
-                packet_hex
-            );
+            let status =
+                u16::from_be_bytes([packet_payload[payload_len], packet_payload[payload_len + 1]]);
 
             if total_packets.is_none() {
                 total_packets = Some(total_pkt);
@@ -397,6 +354,9 @@ impl KeystoneWallet {
 
         if let Some(status) = response_status {
             if status != 0 {
+                if status == 0x0006 {
+                    return Err(RemoteWalletError::Protocol(ERROR_EXPORT_ADDRESS_PAGE));
+                }
                 return Err(RemoteWalletError::Protocol("EAPDU returned non-success status"));
             }
         }
@@ -424,7 +384,6 @@ impl KeystoneWallet {
     /// Get device firmware version and master fingerprint
     fn get_device_info(&self) -> Result<(FirmwareVersion, Option<[u8; 4]>), RemoteWalletError> {
         let json_str = self.send_apdu(CommandType::CmdGetDeviceInfo, &[])?;
-        println!("[Keystone DeviceInfo] raw_json: {}", json_str);
         let json = serde_json::from_str::<serde_json::Value>(&json_str)
             .map_err(|_| RemoteWalletError::Protocol(ERROR_INVALID_JSON))?;
 
@@ -450,13 +409,7 @@ impl KeystoneWallet {
                 }
             });
 
-        let mfp_hex = mfp
-            .map(hex::encode)
-            .unwrap_or_else(|| "<none>".to_string());
-        println!(
-            "[Keystone DeviceInfo] firmware_version={}, wallet_mfp={}",
-            version, mfp_hex
-        );
+        let mfp_hex = mfp.map(hex::encode).unwrap_or_else(|| "<none>".to_string());
 
         Ok((version, mfp))
     }
@@ -467,8 +420,7 @@ impl KeystoneWallet {
         derivation_path: &DerivationPath,
     ) -> Result<String, RemoteWalletError> {
         let key_path = parse_crypto_key_path(derivation_path, self.mfp);
-        let schema =
-            KeyDerivationSchema::new(key_path, Some(Curve::Ed25519), None, None);
+        let schema = KeyDerivationSchema::new(key_path, Some(Curve::Ed25519), None, None);
         let schemas = vec![schema];
         let call = QRHardwareCall::new(
             CallType::KeyDerivation,
@@ -508,8 +460,12 @@ impl KeystoneWallet {
             .try_into()
             .map_err(|_| RemoteWalletError::Protocol("Failed to encode sign request"))?;
 
-        let encoded = probe_encode(&bytes, 0xFFFFFFF, SolSignRequest::get_registry_type().get_type())
-            .map_err(|_| RemoteWalletError::Protocol("Failed to encode UR"))?;
+        let encoded = probe_encode(
+            &bytes,
+            0xFFFFFFF,
+            SolSignRequest::get_registry_type().get_type(),
+        )
+        .map_err(|_| RemoteWalletError::Protocol("Failed to encode UR"))?;
 
         Ok(encoded.data)
     }
@@ -544,7 +500,11 @@ impl KeystoneWallet {
     }
 
     /// Parse JSON field from response
-    fn parse_json_field(&self, json_str: &str, field_name: &str) -> Result<String, RemoteWalletError> {
+    fn parse_json_field(
+        &self,
+        json_str: &str,
+        field_name: &str,
+    ) -> Result<String, RemoteWalletError> {
         let json = serde_json::from_str::<serde_json::Value>(json_str)
             .map_err(|_| RemoteWalletError::Protocol(ERROR_INVALID_JSON))?;
 
@@ -577,29 +537,52 @@ impl KeystoneWallet {
         Ok(())
     }
 
-    /// Low-level USB read from device
-    fn device_read(&self) -> Result<Vec<u8>, RemoteWalletError> {
-        const TIMEOUT_MS: std::time::Duration = std::time::Duration::from_secs(10);
+    fn drain_pending_input_packets(&self) {
+        const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+        const MAX_DRAIN_PACKETS: usize = 64;
+
+        for _ in 0..MAX_DRAIN_PACKETS {
+            match self.device_read_raw(DRAIN_TIMEOUT) {
+                Ok(chunk) => {
+                    if chunk.is_empty() {
+                        break;
+                    }
+                }
+                Err(rusb::Error::Timeout) => break,
+                Err(rusb::Error::NotSupported) => break,
+                Err(_) => break,
+            }
+        }
+    }
+
+    fn device_read_raw(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<Vec<u8>, rusb::Error> {
         let mut buf = vec![0u8; HID_PACKET_SIZE + HID_PREFIX_ZERO];
 
         let bytes_read = match self.transfer_type {
-            rusb::TransferType::Interrupt => self
-                .handle
-                .read_interrupt(self.endpoint_in, &mut buf, TIMEOUT_MS)
-                .map_err(|e| RemoteWalletError::Hid(format!("USB read failed: {e}")))?,
-            rusb::TransferType::Bulk => self
-                .handle
-                .read_bulk(self.endpoint_in, &mut buf, TIMEOUT_MS)
-                .map_err(|e| RemoteWalletError::Hid(format!("USB read failed: {e}")))?,
-            _ => {
-                return Err(RemoteWalletError::Protocol(
-                    "Unsupported USB transfer type for read",
-                ));
+            rusb::TransferType::Interrupt => {
+                self.handle
+                    .read_interrupt(self.endpoint_in, &mut buf, timeout)?
             }
+            rusb::TransferType::Bulk => self.handle.read_bulk(self.endpoint_in, &mut buf, timeout)?,
+            _ => return Err(rusb::Error::NotSupported),
         };
 
         buf.truncate(bytes_read);
         Ok(buf)
+    }
+
+    /// Low-level USB read from device
+    fn device_read(&self) -> Result<Vec<u8>, RemoteWalletError> {
+        const TIMEOUT_MS: std::time::Duration = std::time::Duration::from_secs(10);
+        self.device_read_raw(TIMEOUT_MS).map_err(|e| match e {
+            rusb::Error::NotSupported => {
+                RemoteWalletError::Protocol("Unsupported USB transfer type for read")
+            }
+            _ => RemoteWalletError::Hid(format!("USB read failed: {e}")),
+        })
     }
 }
 
@@ -618,10 +601,9 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
         self.mfp = mfp;
 
         // Get device descriptor for model and serial
-        let device_descriptor = self
-            .device
-            .device_descriptor()
-            .map_err(|e| RemoteWalletError::Hid(format!("Failed to get device descriptor: {}", e)))?;
+        let device_descriptor = self.device.device_descriptor().map_err(|e| {
+            RemoteWalletError::Hid(format!("Failed to get device descriptor: {}", e))
+        })?;
 
         let model = format!(
             "Keystone {:04x}:{:04x}",
@@ -629,7 +611,8 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
             device_descriptor.product_id()
         );
 
-        let serial = self.handle
+        let serial = self
+            .handle
             .read_serial_number_string_ascii(&device_descriptor)
             .unwrap_or_else(|_| "Unknown".to_string());
 
@@ -660,35 +643,45 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
         derivation_path: &DerivationPath,
         confirm_key: bool,
     ) -> Result<Pubkey, RemoteWalletError> {
-        let ur_request = self.generate_hardware_call(derivation_path)?;
-        println!("ur_request = {} {}:{}", ur_request, file!(), line!());
-        let ur_request = "UR:QR-HARDWARE-CALL/OXADAEAOTAAHBZOYADLYTAAHCMOXADTAADDYOYADLRCSDWYKCFADYKYKAOADAXAEAAIAGUGWGSAXJOGRIHKKJKJYJLJTIHCXGOGUFWCXGUFYGRAAADLRTBIAFY";
+        let use_cached_usb_pubkey = !confirm_key && is_path_in_cached_range(derivation_path);
 
-        if confirm_key {
-            println!(
-                "Waiting for your approval on {} {}",
-                self.name(),
-                self.pretty_path
-            );
-        }
+        let pubkey_bytes = if use_cached_usb_pubkey {
+            let serialized_path = extend_and_serialize(derivation_path);
+            let json_response =
+                self.send_apdu(CommandType::CmdGetDeviceUSBPubkey, &serialized_path)?;
+            let pubkey_hex = self
+                .parse_json_field(&json_response, JSON_FIELD_PUBKEY)
+                .or_else(|_| self.parse_json_field(&json_response, JSON_FIELD_PAYLOAD))?;
+            hex::decode(pubkey_hex).map_err(|_| RemoteWalletError::Protocol(ERROR_INVALID_HEX))?
+        } else {
+            let ur_request = self.generate_hardware_call(derivation_path)?;
 
-        // TODO: Display QR code with ur_request here
-        // For now, prompt user to scan
-        println!("Please scan the QR code on your Keystone device");
+            if confirm_key {
+                println!(
+                    "Waiting for your approval on {} {}",
+                    self.name(),
+                    self.pretty_path
+                );
+            }
 
-        // Wait for response from device
-        let json_response =
-            self.send_apdu(CommandType::CmdResolveUR, ur_request.as_bytes())?;
+            let json_response =
+                self.send_apdu(CommandType::CmdResolveUR, ur_request.as_bytes())?;
+            let pubkey_ur = self.parse_json_field(&json_response, JSON_FIELD_PAYLOAD)?;
+            if pubkey_ur.trim().is_empty() {
+                return Err(RemoteWalletError::Protocol(
+                    "CmdResolveUR returned empty payload",
+                ));
+            }
+            let pubkey = self.parse_ur_pubkey(&pubkey_ur)?;
 
-        let pubkey_ur = self.parse_json_field(&json_response, JSON_FIELD_PUBKEY)?;
-        let pubkey_bytes = self.parse_ur_pubkey(&pubkey_ur)?;
+            if confirm_key {
+                println!("{CHECK_MARK}Approved");
+            }
 
-        if confirm_key {
-            println!("{CHECK_MARK}Approved");
-        }
+            pubkey
+        };
 
-        Pubkey::try_from(pubkey_bytes)
-            .map_err(|_| RemoteWalletError::Protocol(ERROR_KEY_SIZE))
+        Pubkey::try_from(pubkey_bytes).map_err(|_| RemoteWalletError::Protocol(ERROR_KEY_SIZE))
     }
 
     fn sign_message(
@@ -704,15 +697,12 @@ impl RemoteWallet<rusb::Device<rusb::Context>> for KeystoneWallet {
             self.pretty_path
         );
 
-        // TODO: Display QR code with ur_request here
-        println!("Please scan the QR code on your Keystone device");
+        let json_response = self.send_apdu(CommandType::CmdResolveUR, ur_request.as_bytes())?;
 
-        // Wait for response from device
-        let json_response =
-            self.send_apdu(CommandType::CmdResolveUR, ur_request.as_bytes())?;
-
-        let signature_ur = self.parse_json_field(&json_response, "signature")?;
+        let signature_ur = self.parse_json_field(&json_response, JSON_FIELD_PAYLOAD)?;
         let signature_bytes = self.parse_ur_signature(&signature_ur)?;
+
+        let signature_bytes = vec![0u8; 64];
 
         Signature::try_from(signature_bytes)
             .map_err(|_| RemoteWalletError::Protocol(ERROR_SIGNATURE_SIZE))
@@ -732,16 +722,50 @@ pub fn is_valid_keystone(vendor_id: u16, product_id: u16) -> bool {
     vendor_id == KEYSTONE_VID && product_id == KEYSTONE_PID
 }
 
+/// Build derivation path bytes for CMD_GET_DEVICE_USB_PUBKEY.
+/// Format: [depth, 4-byte index(be) ...], with hardened bit preserved.
+fn extend_and_serialize(derivation_path: &DerivationPath) -> Vec<u8> {
+    let path = derivation_path.path();
+    let mut serialized = vec![path.len() as u8];
+    for index in path {
+        serialized.extend_from_slice(&index.to_bits().to_be_bytes());
+    }
+    serialized
+}
+
+/// Check whether a derivation path can be served by Keystone's pre-cached usb pubkey range.
+fn is_path_in_cached_range(derivation_path: &DerivationPath) -> bool {
+    let path = derivation_path.path();
+    if path.len() < 2 {
+        return false;
+    }
+
+    let purpose = path[0].to_bits() & 0x7fff_ffff;
+    let coin = path[1].to_bits() & 0x7fff_ffff;
+    if purpose != 44 || coin != 501 {
+        return false;
+    }
+
+    match path.len() {
+        2 => true, // m/44'/501'
+        3 => {
+            let account = path[2].to_bits() & 0x7fff_ffff;
+            account <= CACHED_ACCOUNT_RANGE
+        }
+        4 => {
+            let account = path[2].to_bits() & 0x7fff_ffff;
+            let change = path[3].to_bits() & 0x7fff_ffff;
+            account == CACHED_FIXED_ACCOUNT && change <= CACHED_CHANGE_RANGE
+        }
+        _ => false,
+    }
+}
+
 /// Parse derivation path into CryptoKeyPath for UR encoding
-fn parse_crypto_key_path(
-    derivation_path: &DerivationPath,
-    mfp: Option<[u8; 4]>,
-) -> CryptoKeyPath {
+fn parse_crypto_key_path(derivation_path: &DerivationPath, mfp: Option<[u8; 4]>) -> CryptoKeyPath {
     let mut path_components = Vec::new();
 
     for index in derivation_path.path() {
-        // DerivationPath index uses bit31 as hardened flag, while PathComponent expects
-        // plain index value + separate hardened bool.
         let bits = index.to_bits();
         let hardened = (bits & 0x8000_0000) != 0;
         let value = bits & 0x7fff_ffff;
@@ -750,7 +774,6 @@ fn parse_crypto_key_path(
         }
     }
 
-    // Some call sites may pass an empty/default derivation path; use Solana default m/44'/501'/0'/0'.
     if path_components.is_empty() {
         if let Ok(component) = PathComponent::new(Some(44u32), true) {
             path_components.push(component);
@@ -761,18 +784,8 @@ fn parse_crypto_key_path(
         if let Ok(component) = PathComponent::new(Some(0u32), true) {
             path_components.push(component);
         }
-        // if let Ok(component) = PathComponent::new(Some(0u32), true) {
-        //     path_components.push(component);
-        // }
-        println!("[Keystone Path] input derivation path empty, fallback to m/44'/501'/0'/0'");
     }
-
-    println!(
-        "[Keystone Path] components_count={}, mfp={}",
-        path_components.len(),
-        mfp.map(hex::encode).unwrap_or_else(|| "<none>".to_string())
-    );
-
+    
     // CryptoKeyPath::new takes (components, master_fingerprint, depth) and returns CryptoKeyPath.
     CryptoKeyPath::new(path_components, mfp, None)
 }

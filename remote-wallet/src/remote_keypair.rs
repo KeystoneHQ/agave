@@ -30,7 +30,9 @@ impl RemoteKeypair {
         let pubkey = match &wallet_type {
             RemoteWalletType::Ledger(wallet) => wallet.get_pubkey(&derivation_path, confirm_key)?,
             RemoteWalletType::Trezor(wallet) => wallet.get_pubkey(&derivation_path, confirm_key)?,
-            RemoteWalletType::Keystone(wallet) => wallet.get_pubkey(&derivation_path, confirm_key)?,
+            RemoteWalletType::Keystone(wallet) => {
+                wallet.get_pubkey(&derivation_path, confirm_key)?
+            }
         };
 
         Ok(Self {

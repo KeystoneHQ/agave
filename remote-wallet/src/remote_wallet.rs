@@ -128,7 +128,7 @@ impl RemoteWalletManager {
 
         let mut detected_devices = vec![];
         let mut errors = vec![];
-        
+
         // Scan for Ledger devices via hidapi
         for device_info in devices.filter(|&device_info| {
             #[cfg(not(any(feature = "linux-static-libusb", feature = "linux-shared-libusb")))]
@@ -204,37 +204,35 @@ impl RemoteWalletManager {
                         // Some firmware modes may expose a different PID; use VID-based prefilter,
                         // then still prefer known Keystone VID/PID path.
                         if desc.vendor_id() == KEYSTONE_VENDOR_ID
-                            || crate::keystone::is_valid_keystone(desc.vendor_id(), desc.product_id())
-                        {
-                            println!(
-                                "[Keystone Discover] candidate vid=0x{:04x}, pid=0x{:04x}",
+                            || crate::keystone::is_valid_keystone(
                                 desc.vendor_id(),
-                                desc.product_id()
-                            );
+                                desc.product_id(),
+                            )
+                        {
                             match device.open() {
-                                Ok(handle) => {
-                                    match KeystoneWallet::new(device.clone(), handle) {
-                                        Ok(mut keystone) => match keystone.read_device(&device) {
-                                            Ok(info) => {
-                                                keystone.pretty_path = info.get_pretty_path();
-                                                trace!("Found Keystone device: {info:?}");
-                                                detected_devices.push(Device {
-                                                    path: info.host_device_path.clone(),
-                                                    info,
-                                                    wallet_type: RemoteWalletType::Keystone(Rc::new(keystone)),
-                                                })
-                                            }
-                                            Err(err) => {
-                                                error!("Error connecting to Keystone device: {err}");
-                                                errors.push(err);
-                                            }
-                                        },
+                                Ok(handle) => match KeystoneWallet::new(device.clone(), handle) {
+                                    Ok(mut keystone) => match keystone.read_device(&device) {
+                                        Ok(info) => {
+                                            keystone.pretty_path = info.get_pretty_path();
+                                            trace!("Found Keystone device: {info:?}");
+                                            detected_devices.push(Device {
+                                                path: info.host_device_path.clone(),
+                                                info,
+                                                wallet_type: RemoteWalletType::Keystone(Rc::new(
+                                                    keystone,
+                                                )),
+                                            })
+                                        }
                                         Err(err) => {
-                                            error!("Error initializing Keystone USB transport: {err}");
+                                            error!("Error connecting to Keystone device: {err}");
                                             errors.push(err);
                                         }
+                                    },
+                                    Err(err) => {
+                                        error!("Error initializing Keystone USB transport: {err}");
+                                        errors.push(err);
                                     }
-                                }
+                                },
                                 Err(err) => {
                                     error!("Failed to open Keystone device: {err}");
                                     errors.push(RemoteWalletError::Hid(format!(
