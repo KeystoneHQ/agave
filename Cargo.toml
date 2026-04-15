@@ -334,6 +334,7 @@ reqwest-middleware = "0.4.2"
 rolling-file = "0.2.0"
 rpassword = "7.4"
 rts-alloc = { version = "3.0.0" }
+rusb = "0.9"
 rustls = { version = "0.23.37", features = ["std"], default-features = false }
 scopeguard = "1.2.0"
 semver = "1.0.28"
@@ -574,6 +575,8 @@ trezor-client = { version = "0.1.5", default-features = false, features = ["sola
 tungstenite = "0.28.0"
 unwrap_none = "0.1.2"
 uriparse = "0.6.4"
+ur-registry = { git = "https://github.com/KeystoneHQ/keystone-sdk-rust.git", tag = "0.0.56", default-features = false, features = ["std"] }
+ur-parse-lib = { git = "https://github.com/KeystoneHQ/keystone-sdk-rust.git", tag = "0.0.56" }
 url = "2.5.8"
 winapi = "0.3.8"
 wincode = { version = "0.5.1", features = ["derive", "solana-short-vec"] }
