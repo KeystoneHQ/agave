@@ -1649,9 +1649,12 @@ impl AccountsDb {
             },
         );
         let total = pubkey_refcount.len();
+        if total == 0 {
+            return;
+        }
         let failed = AtomicBool::default();
         let threads = quarter_thread_count();
-        let per_batch = total / threads;
+        let per_batch = total.div_ceil(threads);
         (0..=threads).into_par_iter().for_each(|attempt| {
             pubkey_refcount
                 .iter()
@@ -3458,7 +3461,7 @@ impl AccountsDb {
             }
             self.accounts_index.get_with_and_then(
                 &pubkey,
-                Some(ancestors),
+                ancestors,
                 Some(max_root),
                 true,
                 |(slot, account_info)| {
@@ -3605,7 +3608,7 @@ impl AccountsDb {
         let max_root_slot = ancestors.min_slot();
         self.accounts_index.get_with_and_then(
             pubkey,
-            Some(ancestors),
+            ancestors,
             max_root_slot,
             true,
             |(slot, account_info)| {
@@ -4823,7 +4826,7 @@ impl AccountsDb {
                             .accounts_index
                             .get_with_and_then(
                                 &pubkey,
-                                Some(ancestors),
+                                ancestors,
                                 Some(startup_slot),
                                 false,
                                 |(slot, account_info)| {
@@ -4882,7 +4885,7 @@ impl AccountsDb {
                         self.accounts_index
                             .get_with_and_then(
                                 &pubkey,
-                                Some(ancestors),
+                                ancestors,
                                 Some(startup_slot),
                                 false,
                                 |(slot, account_info)| {
@@ -5625,7 +5628,7 @@ impl AccountsDb {
                     return;
                 }
                 if account.is_zero_lamport() {
-                    if ancestors.is_some() {
+                    if let Some(ancestors) = ancestors {
                         if let Some(is_zero_lamport) = self.accounts_index.get_with_and_then(
                             pubkey,
                             ancestors,

@@ -42,7 +42,6 @@ use {
 /// If a cert or vote is so many slots in the future relative to the root slot, it is considered
 /// invalid and discarded.
 ///
-/// At 400ms slot times, 90K slots is roughly 10 hours i.e. we reject votes and certs 10 hrs into the future.
 /// This also sets an upper bound on how much storage the various structs in this module require.
 pub(super) const NUM_SLOTS_FOR_VERIFY: Slot = 90_000;
 
@@ -282,7 +281,7 @@ impl SigVerifier {
                 self.stats.discard_vote_invalid_rank += 1;
                 None
             })?;
-        let ret = Some((entry.pubkey, entry.bls_pubkey));
+        let ret = Some((entry.vote_account_pubkey, entry.bls_pubkey));
         if vote.vote.slot() > root_slot {
             return ret;
         }

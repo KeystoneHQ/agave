@@ -609,8 +609,8 @@ pub fn process_new_vote_state(
     Ok(())
 }
 
-pub fn process_vote_unfiltered<T: VoteStateHandle>(
-    vote_state: &mut T,
+pub fn process_vote_unfiltered(
+    vote_state: &mut VoteStateHandler,
     vote_slots: &[Slot],
     vote: &Vote,
     slot_hashes: &[SlotHash],
@@ -655,8 +655,8 @@ pub fn process_vote(
 }
 
 /// "unchecked" functions used by tests and Tower
-pub fn process_vote_unchecked<T: VoteStateHandle>(
-    vote_state: &mut T,
+pub fn process_vote_unchecked(
+    vote_state: &mut VoteStateHandler,
     vote: Vote,
 ) -> Result<(), VoteError> {
     if vote.slots.is_empty() {
@@ -674,13 +674,13 @@ pub fn process_vote_unchecked<T: VoteStateHandle>(
 }
 
 #[cfg(test)]
-pub fn process_slot_votes_unchecked<T: VoteStateHandle>(vote_state: &mut T, slots: &[Slot]) {
+pub fn process_slot_votes_unchecked(vote_state: &mut VoteStateHandler, slots: &[Slot]) {
     for slot in slots {
         process_slot_vote_unchecked(vote_state, *slot);
     }
 }
 
-pub fn process_slot_vote_unchecked<T: VoteStateHandle>(vote_state: &mut T, slot: Slot) {
+pub fn process_slot_vote_unchecked(vote_state: &mut VoteStateHandler, slot: Slot) {
     let _ = process_vote_unchecked(vote_state, Vote::new(vec![slot], Hash::default()));
 }
 
@@ -4043,7 +4043,7 @@ mod tests {
             inflation_rewards_commission_bps,
             &authorized_withdrawer,
             0,
-            &authorized_withdrawer,
+            &node_pubkey,
             lamports,
         );
         assert_eq!(vote_account.lamports(), lamports);
@@ -4165,7 +4165,7 @@ mod tests {
             inflation_rewards_commission_bps,
             &authorized_withdrawer,
             0,
-            &authorized_withdrawer,
+            &node_pubkey,
             lamports,
         );
         assert_eq!(vote_account.lamports(), lamports);
@@ -4216,9 +4216,13 @@ mod tests {
             )
             .is_ok()
         );
-        let vote_state =
-            VoteStateV4::deserialize(borrowed_account.get_data(), &new_node_pubkey).unwrap();
-        assert_eq!(vote_state.bls_pubkey_compressed, Some(bls_pubkey));
+        let vote_state = VoteStateHandler::new_v4(
+            VoteStateV4::deserialize(borrowed_account.get_data(), &new_node_pubkey).unwrap(),
+        );
+        assert_eq!(
+            vote_state.as_ref_v4().bls_pubkey_compressed,
+            Some(bls_pubkey)
+        );
         assert!(vote_state.has_bls_pubkey());
 
         // Test replay attack, can't use someone else's BLS pubkey and PoP
@@ -4276,9 +4280,13 @@ mod tests {
             ),
             Ok(())
         );
-        let vote_state =
-            VoteStateV4::deserialize(borrowed_account.get_data(), &new_authorized_voter).unwrap();
-        assert_eq!(vote_state.bls_pubkey_compressed, Some(new_bls_pubkey));
+        let vote_state = VoteStateHandler::new_v4(
+            VoteStateV4::deserialize(borrowed_account.get_data(), &new_authorized_voter).unwrap(),
+        );
+        assert_eq!(
+            vote_state.as_ref_v4().bls_pubkey_compressed,
+            Some(new_bls_pubkey)
+        );
         assert!(vote_state.has_bls_pubkey());
     }
 
@@ -5296,10 +5304,12 @@ mod tests {
             get_vote_state_handler_checked(&borrowed, VoteStateTargetVersion::V4).unwrap();
         vote_state.set_vote_account_state(&mut borrowed).unwrap();
 
-        let v4 = VoteStateV4::deserialize(borrowed.get_data(), &vote_pubkey).unwrap();
-        assert_eq!(v4.bls_pubkey_compressed, None);
+        let v4 = VoteStateHandler::new_v4(
+            VoteStateV4::deserialize(borrowed.get_data(), &vote_pubkey).unwrap(),
+        );
+        assert_eq!(v4.as_ref_v4().bls_pubkey_compressed, None);
         assert!(!v4.has_bls_pubkey());
-        assert_eq!(v4.last_timestamp, last_timestamp);
+        assert_eq!(v4.as_ref_v4().last_timestamp, last_timestamp);
     }
 
     #[test]
