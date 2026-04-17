@@ -106,7 +106,6 @@ pub struct LeaderProcessedTransactionCounts {
 pub struct Consumer {
     committer: Committer,
     transaction_recorder: TransactionRecorder,
-    qos_service: QosService,
     log_messages_bytes_limit: Option<usize>,
 }
 
@@ -114,13 +113,11 @@ impl Consumer {
     pub fn new(
         committer: Committer,
         transaction_recorder: TransactionRecorder,
-        qos_service: QosService,
         log_messages_bytes_limit: Option<usize>,
     ) -> Self {
         Self {
             committer,
             transaction_recorder,
-            qos_service,
             log_messages_bytes_limit,
         }
     }
@@ -200,7 +197,7 @@ impl Consumer {
         let (
             (transaction_qos_cost_results, cost_model_throttled_transactions_count),
             cost_model_us,
-        ) = measure_us!(self.qos_service.select_and_accumulate_transaction_costs(
+        ) = measure_us!(QosService::select_and_accumulate_transaction_costs(
             bank,
             txs,
             pre_results
@@ -240,9 +237,6 @@ impl Consumer {
             commit_transactions_result.as_ref().ok(),
             bank,
         );
-
-        // reports qos service stats for this batch
-        self.qos_service.report_metrics(bank.slot());
 
         debug!(
             "bank: {} lock: {}us unlock: {}us txs_len: {}",
@@ -346,25 +340,6 @@ impl Consumer {
             processed_counts,
             balance_collector,
         } = load_and_execute_transactions_output;
-
-        let actual_execute_time = execute_and_commit_timings
-            .execute_timings
-            .execute_accessories
-            .process_instructions
-            .total_us
-            .0;
-        let actual_executed_cu = processing_results
-            .iter()
-            .map(|processing_result| {
-                processing_result
-                    .as_ref()
-                    .map_or(0, |pr| pr.executed_units())
-            })
-            .sum();
-        self.qos_service
-            .accumulate_actual_execute_cu(actual_executed_cu);
-        self.qos_service
-            .accumulate_actual_execute_time(actual_execute_time);
 
         let transaction_counts = LeaderProcessedTransactionCounts {
             processed_count: processed_counts.processed_transactions_count,
@@ -608,7 +583,7 @@ mod tests {
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(transaction_status_sender, replay_vote_sender, None);
-        let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+        let consumer = Consumer::new(committer, recorder, None);
 
         TestFrame {
             mint_keypair,
@@ -631,7 +606,7 @@ mod tests {
 
         let (replay_vote_sender, _replay_vote_receiver) = unbounded();
         let committer = Committer::new(None, replay_vote_sender, None);
-        let consumer = Consumer::new(committer, recorder, QosService::new(1), None);
+        let consumer = Consumer::new(committer, recorder, None);
         consumer.process_and_record_transactions(&bank, &transactions)
     }
 
