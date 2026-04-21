@@ -127,17 +127,12 @@ impl RuntimeTransaction<SanitizedTransaction> {
             reserved_account_keys,
         )?;
 
-        let mut tx = Self {
+        let tx = Self {
             transaction: sanitized_transaction,
             meta: statically_loaded_runtime_tx.meta,
         };
-        tx.load_dynamic_metadata()?;
 
         Ok(tx)
-    }
-
-    fn load_dynamic_metadata(&mut self) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -370,9 +365,7 @@ mod tests {
             );
             assert_eq!(
                 loaded_accounts_bytes,
-                transaction_configuration
-                    .loaded_accounts_data_size_limit
-                    .get()
+                transaction_configuration.loaded_accounts_data_size_limit
             );
         }
     }

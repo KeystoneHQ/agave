@@ -46,8 +46,8 @@ use {
     },
     solana_client_traits::SyncClient,
     solana_clock::{
-        BankId, DEFAULT_TICKS_PER_SLOT, Epoch, INITIAL_RENT_EPOCH, MAX_PROCESSING_AGE,
-        MAX_RECENT_BLOCKHASHES, Slot, UnixTimestamp,
+        BankId, DEFAULT_TICKS_PER_SLOT, Epoch, INITIAL_RENT_EPOCH, MAX_RECENT_BLOCKHASHES, Slot,
+        UnixTimestamp,
     },
     solana_cluster_type::ClusterType,
     solana_compute_budget::{
@@ -1139,17 +1139,15 @@ fn test_one_source_two_tx_one_batch() {
 
     assert_eq!(res.len(), 2);
     assert_eq!(res[0], Ok(()));
-    assert_eq!(res[1], Err(TransactionError::AccountInUse));
+    assert_eq!(res[1], Ok(()));
     assert_eq!(
         bank.get_balance(&mint_keypair.pubkey()),
-        LAMPORTS_PER_SOL - amount
+        LAMPORTS_PER_SOL - amount * 2
     );
     assert_eq!(bank.get_balance(&key1), amount);
-    assert_eq!(bank.get_balance(&key2), 0);
+    assert_eq!(bank.get_balance(&key2), amount);
     assert_eq!(bank.get_signature_status(&t1.signatures[0]), Some(Ok(())));
-    // TODO: Transactions that fail to pay a fee could be dropped silently.
-    // Non-instruction errors don't get logged in the signature cache
-    assert_eq!(bank.get_signature_status(&t2.signatures[0]), None);
+    assert_eq!(bank.get_signature_status(&t2.signatures[0]), Some(Ok(())));
 }
 
 #[test]
@@ -1448,6 +1446,10 @@ fn test_bank_tx_fee() {
 
     let mut bank = Bank::new_for_tests(&genesis_config);
     bank.set_fee_structure(&fee_structure);
+
+    let leader = *bank.leader();
+    let collector_id = leader.id;
+
     let (bank, bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let capitalization = bank.capitalization();
@@ -1460,7 +1462,7 @@ fn test_bank_tx_fee() {
         bank.last_blockhash(),
     );
 
-    let initial_balance = bank.get_balance(&leader.id);
+    let initial_balance = bank.get_balance(&collector_id);
     assert_eq!(bank.process_transaction(&tx), Ok(()));
     assert_eq!(bank.get_balance(&key), arbitrary_transfer_amount);
     assert_eq!(
@@ -1468,11 +1470,11 @@ fn test_bank_tx_fee() {
         mint - arbitrary_transfer_amount - expected_fee_paid
     );
 
-    assert_eq!(bank.get_balance(&leader.id), initial_balance);
+    assert_eq!(bank.get_balance(&collector_id), initial_balance);
     goto_end_of_slot(bank.clone());
     assert_eq!(bank.signature_count(), 1);
     assert_eq!(
-        bank.get_balance(&leader.id),
+        bank.get_balance(&collector_id),
         initial_balance + expected_fee_collected
     ); // Leader collects fee after the bank is frozen
 
@@ -1486,7 +1488,7 @@ fn test_bank_tx_fee() {
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader.id,
+            collector_id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1514,14 +1516,14 @@ fn test_bank_tx_fee() {
 
     // Profit! 2 transaction signatures processed at 3 lamports each
     assert_eq!(
-        bank.get_balance(&leader.id),
+        bank.get_balance(&collector_id),
         initial_balance + 2 * expected_fee_collected
     );
 
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader.id,
+            collector_id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1549,6 +1551,9 @@ fn test_bank_tx_compute_unit_fee() {
 
     let (bank, bank_forks) = Bank::new_with_bank_forks_for_tests(&genesis_config);
 
+    let leader = *bank.leader();
+    let collector_id = leader.id;
+
     let expected_fee_paid = calculate_test_fee(
         &new_sanitized_message(Message::new(&[], Some(&Pubkey::new_unique()))),
         bank.fee_structure(),
@@ -1566,7 +1571,7 @@ fn test_bank_tx_compute_unit_fee() {
         bank.last_blockhash(),
     );
 
-    let initial_balance = bank.get_balance(&leader.id);
+    let initial_balance = bank.get_balance(&collector_id);
     assert_eq!(bank.process_transaction(&tx), Ok(()));
     assert_eq!(bank.get_balance(&key), arbitrary_transfer_amount);
     assert_eq!(
@@ -1574,11 +1579,11 @@ fn test_bank_tx_compute_unit_fee() {
         mint - arbitrary_transfer_amount - expected_fee_paid
     );
 
-    assert_eq!(bank.get_balance(&leader.id), initial_balance);
+    assert_eq!(bank.get_balance(&collector_id), initial_balance);
     goto_end_of_slot(bank.clone());
     assert_eq!(bank.signature_count(), 1);
     assert_eq!(
-        bank.get_balance(&leader.id),
+        bank.get_balance(&collector_id),
         initial_balance + expected_fee_collected
     ); // Leader collects fee after the bank is frozen
 
@@ -1592,7 +1597,7 @@ fn test_bank_tx_compute_unit_fee() {
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader.id,
+            collector_id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1620,14 +1625,14 @@ fn test_bank_tx_compute_unit_fee() {
 
     // Profit! 2 transaction signatures processed at 3 lamports each
     assert_eq!(
-        bank.get_balance(&leader.id),
+        bank.get_balance(&collector_id),
         initial_balance + 2 * expected_fee_collected
     );
 
     assert_eq!(
         *bank.rewards.read().unwrap(),
         vec![(
-            leader.id,
+            collector_id,
             RewardInfo {
                 reward_type: RewardType::Fee,
                 lamports: expected_fee_collected as i64,
@@ -1665,19 +1670,14 @@ fn test_debits_before_credits() {
     assert_eq!(bank.non_vote_transaction_count_since_restart(), 1);
 }
 
-#[test_case(false; "old")]
-#[test_case(true; "simd83")]
-fn test_readonly_accounts(relax_intrabatch_account_locks: bool) {
+#[test]
+fn test_readonly_accounts() {
     let GenesisConfigInfo {
         genesis_config,
         mint_keypair,
         ..
     } = create_genesis_config_with_leader(500, &solana_pubkey::new_rand(), 0);
-    let mut bank = Bank::new_for_tests(&genesis_config);
-    if !relax_intrabatch_account_locks {
-        bank.deactivate_feature(&feature_set::relax_intrabatch_account_locks::id());
-    }
-
+    let bank = Bank::new_for_tests(&genesis_config);
     let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
     let next_slot = bank.slot() + 1;
     let bank = Bank::new_from_parent(bank, SlotLeader::default(), next_slot);
@@ -1774,16 +1774,9 @@ fn test_readonly_accounts(relax_intrabatch_account_locks: bool) {
     );
     let txs = [tx0, tx1];
     let results = bank.process_transactions(txs.iter());
-    // Whether an account can be locked as read-only and writable at the same time depends on features.
+    // An account can be locked as read-only and writable at the same time
     assert_eq!(results[0], Ok(()));
-    assert_eq!(
-        results[1],
-        if relax_intrabatch_account_locks {
-            Ok(())
-        } else {
-            Err(TransactionError::AccountInUse)
-        }
-    );
+    assert_eq!(results[1], Ok(()));
 }
 
 #[test]
@@ -3309,7 +3302,7 @@ fn test_bank_get_program_accounts() {
     let (parent, _bank_forks) =
         Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
-    let genesis_accounts: Vec<_> = parent.get_all_accounts(false).unwrap();
+    let genesis_accounts: Vec<_> = parent.get_all_accounts().unwrap();
     assert!(
         genesis_accounts
             .iter()
@@ -8197,9 +8190,8 @@ fn test_vote_epoch_panic() {
     );
 }
 
-#[test_case(false; "old")]
-#[test_case(true; "simd83")]
-fn test_tx_log_order(relax_intrabatch_account_locks: bool) {
+#[test]
+fn test_tx_log_order() {
     let GenesisConfigInfo {
         genesis_config,
         mint_keypair,
@@ -8209,10 +8201,7 @@ fn test_tx_log_order(relax_intrabatch_account_locks: bool) {
         &Pubkey::new_unique(),
         bootstrap_validator_stake_lamports(),
     );
-    let mut bank = Bank::new_for_tests(&genesis_config);
-    if !relax_intrabatch_account_locks {
-        bank.deactivate_feature(&feature_set::relax_intrabatch_account_locks::id());
-    }
+    let bank = Bank::new_for_tests(&genesis_config);
     let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
     *bank.transaction_log_collector_config.write().unwrap() = TransactionLogCollectorConfig {
         mentioned_addresses: HashSet::new(),
@@ -8273,11 +8262,7 @@ fn test_tx_log_order(relax_intrabatch_account_locks: bool) {
             .unwrap()[2]
             .contains(&"failed".to_string())
     );
-    if relax_intrabatch_account_locks {
-        assert!(commit_results[2].is_ok());
-    } else {
-        assert!(commit_results[2].is_err());
-    }
+    assert!(commit_results[2].is_ok());
 
     let stored_logs = &bank.transaction_log_collector.read().unwrap().logs;
     let success_log_info = stored_logs
@@ -10849,7 +10834,11 @@ fn test_feature_activation_loaded_programs_epoch_transition() {
             .global_program_cache
             .write()
             .unwrap();
-        program_cache.prune(bank.slot(), upcoming_environment);
+        program_cache.prune(
+            bank.slot(),
+            upcoming_environment,
+            &bank_forks.read().unwrap(),
+        );
 
         // Unload all (which is only the entry with the new environment)
         program_cache.sort_and_unload(percentage::Percentage::from(0));
@@ -11571,8 +11560,9 @@ fn test_blockhash_last_valid_block_height() {
         Bank::new_for_tests(&genesis_config).wrap_with_bank_forks_for_tests();
 
     // valid until MAX_PROCESSING_AGE
+    let max_processing_age = bank.max_processing_age();
     let last_blockhash = bank.last_blockhash();
-    for i in 1..=MAX_PROCESSING_AGE as u64 {
+    for i in 1..=max_processing_age as u64 {
         goto_end_of_slot(bank.clone());
         bank = Arc::new(new_from_parent(bank));
         assert_eq!(i, bank.block_height);
@@ -11582,13 +11572,13 @@ fn test_blockhash_last_valid_block_height() {
             .unwrap();
         assert_eq!(
             last_valid_block_height,
-            bank.block_height + MAX_PROCESSING_AGE as u64 - i
+            bank.block_height + max_processing_age as u64 - i
         );
         assert!(bank.is_blockhash_valid(&last_blockhash));
     }
 
     // Make sure it stays in the queue until `MAX_RECENT_BLOCKHASHES`
-    for i in MAX_PROCESSING_AGE + 1..=MAX_RECENT_BLOCKHASHES {
+    for i in max_processing_age + 1..=MAX_RECENT_BLOCKHASHES {
         goto_end_of_slot(bank.clone());
         bank = Arc::new(new_from_parent(bank));
         assert_eq!(bank.block_height, i as u64);
@@ -11598,7 +11588,7 @@ fn test_blockhash_last_valid_block_height() {
         let last_valid_block_height = bank
             .get_blockhash_last_valid_block_height(&last_blockhash)
             .unwrap();
-        assert_eq!(last_valid_block_height, MAX_PROCESSING_AGE as u64);
+        assert_eq!(last_valid_block_height, max_processing_age as u64);
 
         // But it isn't valid for processing
         assert!(!bank.is_blockhash_valid(&last_blockhash));
@@ -12054,8 +12044,7 @@ fn test_temporary_account_execute_and_commit() {
     // after the batch has executed.
 
     let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
-    let mut bank = Bank::new_for_tests(&genesis_config);
-    bank.activate_feature(&feature_set::relax_intrabatch_account_locks::ID);
+    let bank = Bank::new_for_tests(&genesis_config);
     let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let fee_calculator = genesis_config.fee_rate_governor.create_fee_calculator();
@@ -12126,8 +12115,7 @@ fn test_temporary_account_recreated_execute_and_commit() {
     // re-created in the final transaction and should be present in final state.
 
     let (genesis_config, _mint_keypair) = create_genesis_config(1_000_000 * LAMPORTS_PER_SOL);
-    let mut bank = Bank::new_for_tests(&genesis_config);
-    bank.activate_feature(&feature_set::relax_intrabatch_account_locks::ID);
+    let bank = Bank::new_for_tests(&genesis_config);
     let (bank, _bank_forks) = bank.wrap_with_bank_forks_for_tests();
 
     let fee_calculator = genesis_config.fee_rate_governor.create_fee_calculator();
