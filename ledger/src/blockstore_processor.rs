@@ -2397,10 +2397,6 @@ fn load_frozen_forks(
                 //
                 // We are safe to cleanly transition to alpenglow here
                 if migration_status.is_ready_to_enable() {
-                    debug_assert!(matches!(
-                        error,
-                        BlockstoreProcessorError::InvalidBlock(BlockError::TooFewTicks),
-                    ));
                     let genesis_slot = migration_status.enable_alpenglow_during_startup();
 
                     // We need to clear pending_slots as it might contain Alpenglow blocks initialized as TowerBFT banks.
@@ -5595,7 +5591,7 @@ pub mod tests {
             ..
         } = create_genesis_config_with_leader(500, &dummy_leader_pubkey, 100);
         let bank = Arc::new(Bank::new_for_tests(&genesis_config));
-        let context = SchedulingContext::for_verification(bank.clone());
+        let context = SchedulingContext::new(bank.clone());
 
         let txs = create_test_transactions(&mint_keypair, &genesis_config.hash());
 
